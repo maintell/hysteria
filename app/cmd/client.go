@@ -94,6 +94,7 @@ type clientConfigObfsSalamander struct {
 type clientConfigObfs struct {
 	Type       string                     `mapstructure:"type"`
 	Salamander clientConfigObfsSalamander `mapstructure:"salamander"`
+	// Webrtc obfuscator has no configurable password; presence is indicated by Type.
 }
 
 type clientConfigTLS struct {
@@ -252,6 +253,11 @@ func (c *clientConfig) fillConnFactory(hyConfig *client.Config) error {
 		if err != nil {
 			return configError{Field: "obfs.salamander.password", Err: err}
 		}
+	case "webrtc":
+		ob, err = obfs.NewWebrtcObfuscator(nil)
+		if err != nil {
+			return configError{Field: "obfs.webrtc", Err: err}
+		}
 	default:
 		return configError{Field: "obfs.type", Err: errors.New("unsupported obfuscation type")}
 	}
@@ -376,6 +382,8 @@ func (c *clientConfig) URI() string {
 	case "salamander":
 		q.Set("obfs", "salamander")
 		q.Set("obfs-password", c.Obfs.Salamander.Password)
+	case "webrtc":
+		q.Set("obfs", "webrtc")
 	}
 	if c.TLS.SNI != "" {
 		q.Set("sni", c.TLS.SNI)
@@ -433,6 +441,8 @@ func (c *clientConfig) parseURI() bool {
 		switch strings.ToLower(obfsType) {
 		case "salamander":
 			c.Obfs.Salamander.Password = q.Get("obfs-password")
+		case "webrtc":
+			// no password to parse for webrtc; presence of type is sufficient
 		}
 	}
 	if sni := q.Get("sni"); sni != "" {

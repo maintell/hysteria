@@ -283,6 +283,13 @@ func (c *serverConfig) fillConn(hyConfig *server.Config) error {
 		}
 		hyConfig.Conn = obfs.WrapPacketConn(conn, ob)
 		return nil
+	case "webrtc":
+		ob, err := obfs.NewWebrtcObfuscator(nil)
+		if err != nil {
+			return configError{Field: "obfs.webrtc", Err: err}
+		}
+		hyConfig.Conn = obfs.WrapPacketConn(conn, ob)
+		return nil
 	default:
 		return configError{Field: "obfs.type", Err: errors.New("unsupported obfuscation type")}
 	}
