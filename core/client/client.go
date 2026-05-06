@@ -58,6 +58,7 @@ type clientImpl struct {
 	config *Config
 
 	pktConn net.PacketConn
+	tr      *quic.Transport
 	conn    *quic.Conn
 
 	udpSM *udpSessionManager
@@ -86,15 +87,17 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		DisablePathMTUDiscovery:        c.config.QUICConfig.DisablePathMTUDiscovery,
 		EnableDatagrams:                true,
 		MaxDatagramFrameSize:           protocol.MaxDatagramFrameSize,
+		OmitMaxDatagramFrameSize:       true,
 		DisablePathManager:             true,
 	}
+	tr := &quic.Transport{Conn: pktConn}
 	// Prepare RoundTripper
 	var conn *quic.Conn
 	rt := &http3.Transport{
 		TLSClientConfig: tlsConfig,
 		QUICConfig:      quicConfig,
 		Dial: func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
-			qc, err := quic.DialEarly(ctx, pktConn, c.config.ServerAddr, tlsCfg, cfg)
+			qc, err := tr.DialEarly(ctx, c.config.ServerAddr, tlsCfg, cfg)
 			if err != nil {
 				return nil, err
 			}
@@ -121,11 +124,13 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		if conn != nil {
 			_ = conn.CloseWithError(closeErrCodeProtocolError, "")
 		}
+		_ = tr.Close()
 		_ = pktConn.Close()
 		return nil, coreErrs.ConnectError{Err: err}
 	}
 	if resp.StatusCode != protocol.StatusAuthOK {
 		_ = conn.CloseWithError(closeErrCodeProtocolError, "")
+		_ = tr.Close()
 		_ = pktConn.Close()
 		return nil, coreErrs.AuthError{StatusCode: resp.StatusCode}
 	}
@@ -134,8 +139,8 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 	var actualTx uint64
 	if authResp.RxAuto {
 		// Server asks client to use bandwidth detection,
-		// ignore local bandwidth config and use BBR
-		congestion.UseBBR(conn)
+		// ignore local bandwidth config and use the configured congestion controller.
+		congestion.UseConfigured(conn, c.config.CongestionConfig.Type, c.config.CongestionConfig.BBRProfile)
 	} else {
 		// actualTx = min(serverRx, clientTx)
 		actualTx = authResp.Rx
@@ -146,13 +151,14 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		if actualTx > 0 {
 			congestion.UseBrutal(conn, actualTx)
 		} else {
-			// We don't know our own bandwidth either, use BBR
-			congestion.UseBBR(conn)
+			// We don't know our own bandwidth either, use the configured congestion controller.
+			congestion.UseConfigured(conn, c.config.CongestionConfig.Type, c.config.CongestionConfig.BBRProfile)
 		}
 	}
 	_ = resp.Body.Close()
 
 	c.pktConn = pktConn
+	c.tr = tr
 	c.conn = conn
 	if authResp.UDPEnabled {
 		c.udpSM = newUDPSessionManager(&udpIOImpl{Conn: conn})
@@ -221,6 +227,7 @@ func (c *clientImpl) UDP() (HyUDPConn, error) {
 
 func (c *clientImpl) Close() error {
 	_ = c.conn.CloseWithError(closeErrCodeOK, "")
+	_ = c.tr.Close()
 	_ = c.pktConn.Close()
 	return nil
 }
