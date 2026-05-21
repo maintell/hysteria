@@ -1,9 +1,12 @@
 package cmd
 
 import (
+	"net"
+	"net/netip"
 	"testing"
 	"time"
 
+	"github.com/apernet/hysteria/core/v2/client"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/spf13/viper"
@@ -53,6 +56,10 @@ func TestClientConfig(t *testing.T) {
 				FirewallMark:        uint32Ref(1234),
 				FdControlUnixSocket: stringRef("test.sock"),
 			},
+		},
+		Congestion: clientConfigCongestion{
+			Type:       "bbr",
+			BBRProfile: "aggressive",
 		},
 		Bandwidth: clientConfigBandwidth{
 			Up:   "200 mbps",
@@ -195,6 +202,143 @@ func TestClientConfigURI(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClientConfigParseRealmAddr(t *testing.T) {
+	c := &clientConfig{Server: "realm+http://token@example.com/realm?stun=stun1.example.com:3478&stun=stun2.example.com:3478"}
+	addr, ok, err := c.parseRealmAddr()
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "http", addr.RendezvousScheme)
+	assert.Equal(t, "token", addr.Token)
+	assert.Equal(t, "realm", addr.RealmID)
+	assert.Equal(t, []string{"stun1.example.com:3478", "stun2.example.com:3478"}, c.realmSTUNServers(addr))
+}
+
+func TestClientConfigRealmSTUNServers(t *testing.T) {
+	addr, ok, err := (&clientConfig{Server: "realm://token@example.com/realm"}).parseRealmAddr()
+	assert.NoError(t, err)
+	assert.True(t, ok)
+
+	c := &clientConfig{}
+	assert.Equal(t, defaultRealmSTUNServers, c.realmSTUNServers(addr))
+
+	c.Realm.STUNServers = []string{"custom.example.com:3478"}
+	assert.Equal(t, []string{"custom.example.com:3478"}, c.realmSTUNServers(addr))
+}
+
+func TestClientConfigParseInvalidRealmAddr(t *testing.T) {
+	_, ok, err := (&clientConfig{Server: "realm://example.com/realm"}).parseRealmAddr()
+	assert.True(t, ok)
+	assert.Error(t, err)
+}
+
+func TestSingleUseConnFactory(t *testing.T) {
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	assert.NoError(t, err)
+	defer conn.Close()
+
+	f := &singleUseConnFactory{Conn: conn}
+	got, err := f.New(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443})
+	assert.NoError(t, err)
+	assert.Equal(t, conn, got)
+
+	_, err = f.New(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443})
+	assert.Error(t, err)
+}
+
+func TestParseAddrPorts(t *testing.T) {
+	addrs, err := parseAddrPorts([]string{"198.51.100.20:4433", "[2001:db8::1]:4433"})
+	assert.NoError(t, err)
+	assert.Equal(t, []netip.AddrPort{
+		netip.MustParseAddrPort("198.51.100.20:4433"),
+		netip.MustParseAddrPort("[2001:db8::1]:4433"),
+	}, addrs)
+
+	_, err = parseAddrPorts([]string{"not-an-address"})
+	assert.Error(t, err)
+}
+
+func TestClientFillCongestionConfig(t *testing.T) {
+	t.Run("defaults to bbr standard", func(t *testing.T) {
+		hyConfig := &client.Config{}
+		err := (&clientConfig{}).fillCongestionConfig(hyConfig)
+		assert.NoError(t, err)
+		assert.Equal(t, "bbr", hyConfig.CongestionConfig.Type)
+		assert.Equal(t, "standard", hyConfig.CongestionConfig.BBRProfile)
+	})
+
+	t.Run("reno ignores bbr profile", func(t *testing.T) {
+		hyConfig := &client.Config{}
+		err := (&clientConfig{
+			Congestion: clientConfigCongestion{
+				Type:       "reno",
+				BBRProfile: "definitely-invalid",
+			},
+		}).fillCongestionConfig(hyConfig)
+		assert.NoError(t, err)
+		assert.Equal(t, "reno", hyConfig.CongestionConfig.Type)
+		assert.Empty(t, hyConfig.CongestionConfig.BBRProfile)
+	})
+
+	t.Run("rejects invalid type", func(t *testing.T) {
+		err := (&clientConfig{
+			Congestion: clientConfigCongestion{Type: "cubic"},
+		}).fillCongestionConfig(&client.Config{})
+		assert.EqualError(t, err, `invalid config: congestion.type: unsupported congestion type "cubic"`)
+	})
+
+	t.Run("rejects invalid bbr profile", func(t *testing.T) {
+		err := (&clientConfig{
+			Congestion: clientConfigCongestion{
+				Type:       "bbr",
+				BBRProfile: "turbo",
+			},
+		}).fillCongestionConfig(&client.Config{})
+		assert.EqualError(t, err, `invalid config: congestion.bbrProfile: unsupported BBR profile "turbo"`)
+	})
+}
+
+func TestClientTransportUDPHopIntervalConfig(t *testing.T) {
+	t.Run("fixed interval", func(t *testing.T) {
+		cfg, err := (clientConfigTransportUDP{HopInterval: 30 * time.Second}).hopIntervalConfig()
+		assert.NoError(t, err)
+		assert.Equal(t, 30*time.Second, cfg.Min)
+		assert.Equal(t, 30*time.Second, cfg.Max)
+	})
+
+	t.Run("range interval", func(t *testing.T) {
+		cfg, err := (clientConfigTransportUDP{
+			MinHopInterval: 10 * time.Second,
+			MaxHopInterval: 30 * time.Second,
+		}).hopIntervalConfig()
+		assert.NoError(t, err)
+		assert.Equal(t, 10*time.Second, cfg.Min)
+		assert.Equal(t, 30*time.Second, cfg.Max)
+	})
+
+	t.Run("default interval", func(t *testing.T) {
+		cfg, err := (clientConfigTransportUDP{}).hopIntervalConfig()
+		assert.NoError(t, err)
+		assert.Zero(t, cfg.Min)
+		assert.Zero(t, cfg.Max)
+	})
+
+	t.Run("rejects mixed fields", func(t *testing.T) {
+		_, err := (clientConfigTransportUDP{
+			HopInterval:    30 * time.Second,
+			MinHopInterval: 10 * time.Second,
+			MaxHopInterval: 30 * time.Second,
+		}).hopIntervalConfig()
+		assert.EqualError(t, err, "hopInterval cannot be used together with minHopInterval or maxHopInterval")
+	})
+
+	t.Run("rejects partial range", func(t *testing.T) {
+		_, err := (clientConfigTransportUDP{
+			MinHopInterval: 10 * time.Second,
+		}).hopIntervalConfig()
+		assert.EqualError(t, err, "minHopInterval and maxHopInterval must both be set")
+	})
 }
 
 func stringRef(s string) *string {
